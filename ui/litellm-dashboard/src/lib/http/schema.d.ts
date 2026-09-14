@@ -3559,6 +3559,7 @@ export interface paths {
         /**
          * Update Credential
          * @description [BETA] endpoint. This might change unexpectedly.
+         *     Like create, ``model_id`` resolves ``credential_values`` from that deployment.
          */
         patch: operations["update_credential_credentials__credential_name__patch"];
         trace?: never;
@@ -37944,6 +37945,21 @@ export interface components {
              */
             blocked_users: string[];
         };
+        /** UpdateCredentialItem */
+        UpdateCredentialItem: {
+            /** Credential Info */
+            credential_info: {
+                [key: string]: unknown;
+            };
+            /** Credential Name */
+            credential_name: string;
+            /** Credential Values */
+            credential_values?: {
+                [key: string]: unknown;
+            } | null;
+            /** Model Id */
+            model_id?: string | null;
+        };
         /**
          * UpdateCustomerRequest
          * @description Update a Customer, use this to update customer budgets etc
@@ -45535,7 +45551,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["CredentialItem"];
+                "application/json": components["schemas"]["UpdateCredentialItem"];
             };
         };
         responses: {
