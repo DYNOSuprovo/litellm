@@ -528,6 +528,9 @@ class TestAutoRouterBenchmarks:
         total_tokens=4000,
         spend=10.0,
         saved_spend=30.0,
+        savings_estimated_turns=40,
+        savings_estimated_actual_spend=10.0,
+        savings_estimated_saved_spend=30.0,
         classifier_cost=0.4,
         classifier_cost_recorded_turns=40,
         session_seconds=400.0,
@@ -564,11 +567,28 @@ class TestAutoRouterBenchmarks:
     def test_a_losing_router_reports_negative_savings(self):
         from litellm.proxy.management_endpoints.auto_router_endpoints import _benchmark_totals
 
-        losing = self.ROW.model_copy(update={"saved_spend": -5.0})
+        losing = self.ROW.model_copy(update={"saved_spend": -5.0, "savings_estimated_saved_spend": -5.0})
         totals = _benchmark_totals(losing)
         assert totals.baseline_spend == 5.0
         assert totals.saved_pct == -100.0
         assert totals.classifier_cost == 0.4
+
+    @pytest.mark.parametrize("estimated_turns", [0, 4])
+    def test_savings_compare_only_the_current_estimated_cohort(self, estimated_turns: int) -> None:
+        from litellm.proxy.management_endpoints.auto_router_endpoints import _benchmark_totals
+
+        row: Final = self.ROW.model_copy(update={
+            "savings_estimated_turns": estimated_turns,
+            "savings_estimated_actual_spend": 2.0 if estimated_turns else 0.0,
+            "savings_estimated_saved_spend": -0.5 if estimated_turns else 0.0,
+        })
+        totals: Final = _benchmark_totals(row)
+        assert totals.spend == 10.0
+        assert totals.savings_estimated_turns == estimated_turns
+        assert totals.saved_spend == (-0.5 if estimated_turns else None)
+        assert totals.baseline_spend == (1.5 if estimated_turns else None)
+        assert totals.saved_pct == (pytest.approx(-33.3) if estimated_turns else None)
+        assert totals.saved_per_session is None
 
     def test_an_empty_window_folds_to_zeros(self):
         from litellm.proxy.management_endpoints.auto_router_endpoints import (
@@ -589,7 +609,10 @@ class TestAutoRouterBenchmarks:
             _summed_agg_row,
         )
 
-        other = self.ROW.model_copy(update={"router_name": "auto-2", "sessions": 1, "turns": 10, "spend": 0.0})
+        other = self.ROW.model_copy(update={
+            "router_name": "auto-2", "sessions": 1, "turns": 10, "spend": 0.0,
+            "savings_estimated_turns": 10, "savings_estimated_actual_spend": 0.0,
+        })
         summed = _summed_agg_row([self.ROW, other])
         totals = _benchmark_totals(summed)
         assert summed.sessions == 5
@@ -678,6 +701,9 @@ class TestAutoRouterBenchmarks:
                 "turns": 10,
                 "spend": 2.0,
                 "saved_spend": -0.5,
+                "savings_estimated_turns": 10,
+                "savings_estimated_actual_spend": 2.0,
+                "savings_estimated_saved_spend": -0.5,
                 "classifier_cost": recorded_turns * 0.02,
                 "classifier_cost_recorded_turns": recorded_turns,
             }
@@ -858,6 +884,10 @@ class TestAutoRouterSession:
         "last_model": "anthropic/claude-sonnet-5",
         "spend": 0.14,
         "saved_spend": 0.24,
+        "savings_estimated_turns": 3,
+        "savings_estimated_actual_spend": 0.14,
+        "savings_estimated_saved_spend": 0.24,
+        "savings_estimated_baseline_models": {"anthropic/claude-opus-5": 3},
         "classifier_cost": 0.0,
         "tier_turns": {"simple": 1, "complex": 2},
         "baseline_models": {"anthropic/claude-opus-5": 3},
@@ -897,7 +927,10 @@ class TestAutoRouterSession:
             "last_model": "anthropic/claude-sonnet-5",
             "spend": 0.14,
             "saved_spend": 0.24,
+            "savings_estimated_turns": 3,
+            "savings_estimated_actual_spend": 0.14,
             "baseline_spend": pytest.approx(0.38),
+            "savings_estimated_baseline_spend": pytest.approx(0.38),
             "baseline_model": "anthropic/claude-opus-5",
             "baseline_models": {"anthropic/claude-opus-5": 3},
         }
@@ -941,21 +974,55 @@ class TestAutoRouterSession:
         from litellm.proxy.management_endpoints.auto_router_endpoints import get_auto_router_session
 
         priced = {"anthropic/claude-opus-5": 2, "anthropic/claude-sonnet-5": 1}
-        self._rig(monkeypatch, [{**self.ROW, "api_key": ADMIN.api_key, "session_id": "s", "baseline_models": priced}])
+        self._rig(monkeypatch, [{
+            **self.ROW, "api_key": ADMIN.api_key, "session_id": "s",
+            "baseline_models": {"old-baseline": 100}, "savings_estimated_baseline_models": priced,
+        }])
         response = await get_auto_router_session(user_api_key_dict=ADMIN, session_id="s")
         assert response.baseline_model == "anthropic/claude-opus-5"
         assert response.baseline_models == priced
 
     @pytest.mark.asyncio
-    async def test_a_session_whose_turns_recorded_no_baseline_reports_the_money_without_a_name(
+    async def test_a_legacy_session_keeps_actual_spend_without_claiming_current_savings(
         self, monkeypatch: pytest.MonkeyPatch
     ):
         from litellm.proxy.management_endpoints.auto_router_endpoints import get_auto_router_session
 
-        self._rig(monkeypatch, [{**self.ROW, "api_key": ADMIN.api_key, "session_id": "s", "baseline_models": {}}])
+        legacy: Final = {
+            key: value for key, value in self.ROW.items() if not key.startswith("savings_estimated_")
+        }
+        self._rig(monkeypatch, [{**legacy, "api_key": ADMIN.api_key, "session_id": "s"}])
         response = await get_auto_router_session(user_api_key_dict=ADMIN, session_id="s")
         assert response.baseline_model is None
-        assert response.baseline_spend == pytest.approx(0.38)
+        assert response.baseline_models == {}
+        assert response.spend == 0.14
+        assert response.saved_spend is None
+        assert response.baseline_spend is None
+        assert response.savings_estimated_baseline_spend is None
+        assert response.savings_estimated_turns == 0
+
+    @pytest.mark.asyncio
+    async def test_partial_savings_cannot_be_compared_to_total_spend_by_older_clients(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from litellm.proxy.management_endpoints.auto_router_endpoints import get_auto_router_session
+
+        self._rig(monkeypatch, [{
+            **self.ROW,
+            "api_key": ADMIN.api_key,
+            "session_id": "partial",
+            "spend": 10.0,
+            "savings_estimated_turns": 1,
+            "savings_estimated_actual_spend": 2.0,
+            "savings_estimated_saved_spend": -0.5,
+        }])
+        response: Final = await get_auto_router_session(user_api_key_dict=ADMIN, session_id="partial")
+        assert response.spend == 10.0
+        assert response.saved_spend == -0.5
+        assert response.baseline_spend is None
+        assert response.savings_estimated_baseline_spend == 1.5
+        assert response.savings_estimated_actual_spend == 2.0
+        assert response.savings_estimated_turns == 1
 
     @pytest.mark.asyncio
     async def test_an_oversized_client_session_id_is_bounded_like_the_writer_bounded_it(

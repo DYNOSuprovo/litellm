@@ -16,10 +16,16 @@ from litellm.llms.anthropic.count_tokens import handler as count_handler
 from litellm.llms.anthropic.experimental_pass_through.messages.transformation import DEFAULT_ANTHROPIC_API_VERSION
 from litellm.llms.anthropic.prompt_cache_prediction import (
     NativePredictionTarget,
+    CountedPromptCachePlan,
+    PromptCachePlan,
+    UnsupportedCachePlan,
     cache_scope,
+    count_cache_plan,
     count_prompt_tokens,
     parse_observed_cache,
     parse_prompt,
+    parse_cache_plan,
+    resolve_baseline_prediction_target,
     resolve_prediction_target,
     supported_prediction_headers,
 )
@@ -207,3 +213,270 @@ async def test_named_credential_is_explicitly_unsupported_before_count(
     assert arm.cache_state == "unknown"
     assert arm.reason == "unsupported_deployment_configuration"
     assert arm.estimate is None and arm.cold is None and arm.warm is None
+
+
+def _cache_plan(body: Mapping[str, JsonValue]) -> PromptCachePlan:
+    plan: Final = parse_cache_plan(body)
+    assert isinstance(plan, PromptCachePlan)
+    return plan
+
+
+def test_cache_plan_preserves_hierarchical_prefixes_and_public_policy() -> None:
+    body: Final[dict[str, JsonValue]] = {
+        "tools": [{"name": "lookup", "input_schema": {"type": "object"},
+                   "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
+        "system": [{"type": "text", "text": "Stable instructions",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "First turn",
+             "cache_control": {"type": "ephemeral"}},
+        ]}],
+    }
+    plan: Final = _cache_plan(body)
+    changed: Final = _cache_plan({**body, "system": [
+        {"type": "text", "text": "Changed instructions",
+         "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+    ]})
+    assert tuple(marker.ttl_seconds for marker in plan.breakpoints) == (3600, 3600, 300)
+    assert plan.breakpoints[0].fingerprint == changed.breakpoints[0].fingerprint
+    assert all(left.fingerprint != right.fingerprint for left, right
+               in zip(plan.breakpoints[1:], changed.breakpoints[1:]))
+    assert plan.breakpoints[0].prefix_body == {
+        "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+        "messages": [],
+    }
+    assert parse_prompt(body) is None
+
+
+@pytest.mark.parametrize("kind, added, matches", [
+    ("text", 19, True), ("text", 20, False), ("tool_use", 30, True),
+    ("tool_result", 30, True),
+])
+def test_cache_plan_lookback_counts_native_positions(
+    kind: str, added: int, matches: bool,
+) -> None:
+    previous: Final = _cache_plan(_body())
+    prefix: Final[dict[str, JsonValue]] = {"type": "text", "text": "A cacheable prefix"}
+    appended: Final = [
+        {"type": "tool_use", "id": f"tool_{index}", "name": "lookup", "input": {}}
+        if kind == "tool_use" else
+        {"type": "tool_result", "tool_use_id": f"tool_{index}", "content": "done"}
+        if kind == "tool_result" else
+        {"type": "text", "text": f"Added {index}"}
+        for index in range(added)
+    ]
+    current: Final = _cache_plan({**_body(), "messages": [{"role": "user", "content": [
+        prefix, *appended[:-1], {**appended[-1], "cache_control": {"type": "ephemeral"}},
+    ]}]})
+    assert (previous.breakpoints[0].fingerprint
+            in current.breakpoints[0].lookback_fingerprints) is matches
+
+
+def test_cache_plan_tool_json_order_and_settings_do_not_fabricate_matches() -> None:
+    first_input: Final[dict[str, JsonValue]] = {
+        "a": 1, "b": 2, "cache_control": {"ttl": "user-data"},
+    }
+    second_input: Final[dict[str, JsonValue]] = {
+        "b": 2, "a": 1, "cache_control": {"ttl": "user-data"},
+    }
+
+    def body(tool_input: Mapping[str, JsonValue], effort: str) -> dict[str, JsonValue]:
+        return {"output_config": {"effort": effort}, "messages": [
+            {"role": "assistant", "content": [{
+                "type": "tool_use", "id": "tool_1", "name": "lookup",
+                "input": dict(tool_input), "cache_control": {"type": "ephemeral"},
+            }]},
+        ]}
+
+    first: Final = _cache_plan(body(first_input, "low"))
+    reordered: Final = _cache_plan(body(second_input, "low"))
+    changed_effort: Final = _cache_plan(body(first_input, "high"))
+    assert first.breakpoints[0].fingerprint != reordered.breakpoints[0].fingerprint
+    assert first.breakpoints[0].fingerprint != changed_effort.breakpoints[0].fingerprint
+    assert "user-data" in json.dumps(dict(first.breakpoints[0].prefix_body))
+
+
+def test_cache_plan_keeps_content_identity_when_ttl_changes() -> None:
+    five_minutes: Final = _cache_plan(_body())
+    one_hour: Final = _cache_plan({**_body(), "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "A cacheable prefix",
+         "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+    ]}]})
+    before: Final = five_minutes.breakpoints[0]
+    after: Final = one_hour.breakpoints[0]
+    assert before.fingerprint != after.fingerprint
+    assert before.content_fingerprint == after.content_fingerprint
+    assert before.content_fingerprint in after.lookback_content_fingerprints
+
+
+def test_cache_plan_automatic_cache_and_thinking_use_last_cacheable_block() -> None:
+    body: Final[dict[str, JsonValue]] = {
+        "thinking": {"type": "adaptive"},
+        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        "messages": [{"role": "assistant", "content": [
+            {"type": "text", "text": "A stable answer"},
+            {"type": "thinking", "thinking": "Thinking", "signature": "signature"},
+        ]}],
+    }
+    plan: Final = _cache_plan(body)
+    assert len(plan.breakpoints) == 1
+    assert plan.breakpoints[0].index == 0
+    assert plan.breakpoints[0].ttl_seconds == 3600
+    assert plan.breakpoints[0].prefix_body == {
+        "thinking": {"type": "adaptive"},
+        "messages": [{"role": "assistant", "content": [
+            {"type": "text", "text": "A stable answer"},
+        ]}],
+    }
+    assert parse_prompt(body) is None
+
+
+@pytest.mark.parametrize("body, reason", [
+    ({"messages": [{"role": "user", "content": [{"type": "image"}]}]},
+     "unsupported_prompt_shape"),
+    ({**_body(), "unknown_native_setting": True}, "unsupported_prompt_shape"),
+    ({**_body(), "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+     "conflicting_cache_ttl"),
+    ({"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "five", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "hour",
+         "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+    ]}]}, "invalid_cache_ttl_order"),
+])
+def test_cache_plan_unsupported_is_explicit(
+    body: Mapping[str, JsonValue], reason: str,
+) -> None:
+    result: Final = parse_cache_plan(body)
+    assert isinstance(result, UnsupportedCachePlan)
+    assert result.reason == reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("counts, reason", [
+    ((100, 150, 200), None), ((100, 201, 200), "inconsistent_prefix_token_count"),
+    ((151, 150, 200), "inconsistent_prefix_token_count"),
+    ((None, 150, 200), "token_count_unavailable"),
+])
+async def test_cache_plan_count_conserves_total_and_rejects_unknown(
+    counts: tuple[int | None, int | None, int], reason: str | None,
+) -> None:
+    plan: Final = _cache_plan({"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "first", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "second", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "uncached"},
+    ]}]})
+
+    async def count(model: str, api_key: str, body: Mapping[str, JsonValue]) -> int | None:
+        if body is plan.full_body:
+            return counts[2]
+        return counts[0] if body is plan.breakpoints[0].prefix_body else counts[1]
+
+    result: Final = await count_cache_plan(_MODEL, _KEY, plan, count)
+    if reason is not None:
+        assert isinstance(result, UnsupportedCachePlan)
+        assert result.reason == reason
+    else:
+        assert isinstance(result, CountedPromptCachePlan)
+        assert result.total_tokens == 200
+        assert tuple(marker.prefix_tokens for marker in result.breakpoints) == (100, 150)
+
+
+@pytest.mark.asyncio
+async def test_baseline_count_keeps_settings_and_uses_trusted_native_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    monkeypatch.setattr(litellm, "in_memory_llm_clients_cache", LLMClientCache())
+    params: Final = LiteLLM_Params(
+        model=f"anthropic/{_MODEL}", api_key=_KEY,
+        api_base="https://gateway.example/v1/messages",
+    )
+    target: Final = resolve_baseline_prediction_target(params)
+    assert isinstance(target, NativePredictionTarget)
+    assert target.api_base == params.api_base
+    assert not isinstance(resolve_prediction_target(params), NativePredictionTarget)
+    body: Final[dict[str, JsonValue]] = {
+        "messages": [], "system": "A system-only prefix",
+        "thinking": {"type": "adaptive"}, "tool_choice": {"type": "auto"},
+        "output_config": {"effort": "high"}, "max_tokens": 100,
+    }
+    with respx.mock() as upstream:
+        route: Final = upstream.post(
+            "https://gateway.example/v1/messages/count_tokens",
+        ).respond(200, json={"input_tokens": 123})
+        assert await count_prompt_tokens(
+            target.model, target.api_key, body, api_base=target.api_base,
+        ) == 123
+    assert json.loads(route.calls.last.request.content) == {
+        key: value for key, value in {**body, "model": _MODEL}.items()
+        if key != "max_tokens"
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("section", ["system", "tools"])
+async def test_rejected_early_prefix_keeps_whole_baseline_count_unknown(
+    section: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    monkeypatch.setattr(litellm, "in_memory_llm_clients_cache", LLMClientCache())
+    body: Final = _body()
+    marker: Final[dict[str, JsonValue]] = {"type": "ephemeral", "ttl": "1h"}
+    body[section] = ([{
+        "type": "text", "text": "A cached system", "cache_control": marker,
+    }] if section == "system" else [{
+        "name": "lookup", "input_schema": {"type": "object"}, "cache_control": marker,
+    }])
+    body["messages"] = [{"role": "user", "content": [
+        {"type": "text", "text": "A later prefix", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "An uncached suffix"},
+    ]}]
+    plan: Final = _cache_plan(body)
+    assert len(plan.breakpoints) == 2
+    assert plan.breakpoints[0].prefix_body["messages"] == []
+
+    async def count(model: str, api_key: str, request: Mapping[str, JsonValue]) -> int | None:
+        return await count_prompt_tokens(
+            model, api_key, request, api_base="https://gateway.example/v1/messages",
+        )
+
+    with respx.mock(assert_all_called=False) as upstream:
+        endpoint: Final = "https://gateway.example/v1/messages/count_tokens"
+        total: Final = upstream.post(
+            endpoint, json={**plan.full_body, "model": _MODEL},
+        ).respond(200, json={"input_tokens": 6000})
+        early: Final = upstream.post(
+            endpoint, json={**plan.breakpoints[0].prefix_body, "model": _MODEL},
+        ).respond(400, json={"detail": {"error": "messages parameter is required"}})
+        later: Final = upstream.post(
+            endpoint, json={**plan.breakpoints[1].prefix_body, "model": _MODEL},
+        ).respond(200, json={"input_tokens": 5800})
+        unexpected: Final = upstream.post(endpoint).respond(200, json={"input_tokens": 1})
+        result: Final = await count_cache_plan(_MODEL, _KEY, plan, count)
+
+    assert result == UnsupportedCachePlan("token_count_unavailable")
+    assert (total.call_count, early.call_count, later.call_count) == (1, 1, 1)
+    assert unexpected.call_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model, supported", [
+    ("claude-opus-5", True), ("claude-sonnet-5", True),
+    ("claude-haiku-4-5", False), ("claude-sonnet-4-5", False),
+])
+async def test_cache_plan_thinking_requires_verified_retention(
+    model: str, supported: bool,
+) -> None:
+    plan: Final = _cache_plan({"messages": [{"role": "assistant", "content": [
+        {"type": "thinking", "thinking": "Retained thought", "signature": "signature"},
+        {"type": "text", "text": "Answer", "cache_control": {"type": "ephemeral"}},
+    ]}]})
+
+    async def count(model: str, api_key: str, body: Mapping[str, JsonValue]) -> int | None:
+        assert supported
+        return 100
+
+    result: Final = await count_cache_plan(model, _KEY, plan, count)
+    assert isinstance(result, CountedPromptCachePlan) is supported
+    if not supported:
+        assert result == UnsupportedCachePlan("unsupported_thinking_cache_semantics")

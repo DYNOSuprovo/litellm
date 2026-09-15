@@ -281,6 +281,9 @@ class TestFlush:
             0,
             "medium",
             "anthropic/claude-opus-5",
+            0,
+            0.0,
+            0.0,
         )
 
     def test_a_connect_error_retries_the_same_statement(self):
@@ -305,6 +308,36 @@ class TestFlush:
 
 
 class TestEnqueueSeam:
+    @pytest.mark.asyncio
+    async def test_only_current_estimates_enter_the_savings_cohort(self) -> None:
+        from litellm.proxy.db.db_spend_update_writer import DBSpendUpdateWriter
+
+        writer: Final = DBSpendUpdateWriter()
+        fake_prisma: Final = SimpleNamespace(
+            _autorouter_turn_transactions_lock=asyncio.Lock(), autorouter_turn_transactions=[]
+        )
+        for estimate in (
+            {"version": 1, "status": "estimated"},
+            {"version": 1, "status": "unknown", "reason": "history_unavailable"},
+            {"version": 0, "status": "estimated"},
+            None,
+        ):
+            metadata: Final = _metadata(
+                routing_decision={**ROUTING_DECISION, "classifier_cost": 0.005},
+                autorouter_savings=-0.003,
+                autorouter_savings_estimate=estimate,
+            )
+            await writer._enqueue_autorouter_turn_transaction(
+                payload=_payload(metadata=json.dumps(metadata)), prisma_client=fake_prisma
+            )
+        transactions: Final = fake_prisma.autorouter_turn_transactions
+        assert len(transactions) == 4
+        assert sum(turn.spend for turn in transactions) == pytest.approx(0.06)
+        assert sum(turn.savings_estimated_turns for turn in transactions) == 1
+        assert sum(turn.savings_estimated_actual_spend for turn in transactions) == pytest.approx(0.015)
+        assert sum(turn.savings_estimated_saved_spend for turn in transactions) == pytest.approx(-0.003)
+        assert tuple(turn.saved_spend for turn in transactions) == (-0.003, 0.0, 0.0, -0.003)
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize("classifier_cost", [0.005, 0.0, None])
     async def test_update_database_seam_enqueues_only_auto_routed_success(self, classifier_cost: float | None):

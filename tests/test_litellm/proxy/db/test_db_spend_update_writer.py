@@ -8,6 +8,7 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from typing import Final
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -2373,6 +2374,57 @@ async def test_daily_transaction_carries_compression_saved_tokens():
     )
     assert transaction["compression_savings_spend"] > 0
     assert transaction["prompt_caching_savings_spend"] > 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("estimate", "recorded_savings", "expected"),
+    (
+        ({"version": 1, "status": "unknown"}, None, 0.0),
+        ({"version": 1, "status": "unknown"}, -0.003, 0.0),
+        ({"version": 0, "status": "estimated"}, -0.003, 0.0),
+        ({"version": 1, "status": "estimated"}, -0.003, -0.003),
+        (None, -0.003, -0.003),
+    ),
+)
+async def test_daily_savings_preserves_unknown_estimates_without_recomputing(
+    estimate: dict[str, object] | None,
+    recorded_savings: float | None,
+    expected: float,
+) -> None:
+    writer: Final = DBSpendUpdateWriter()
+    prisma: Final = MagicMock(get_request_status=MagicMock(return_value="success"))
+    metadata: Final = {
+        "routing_decision": {
+            "router_model_name": "test-auto",
+            "savings_baseline_model": "anthropic/claude-sonnet-5",
+            "classifier_cost": 0.005,
+        },
+        "usage_object": {"prompt_tokens": 100, "completion_tokens": 10},
+        "autorouter_savings": recorded_savings,
+        "autorouter_savings_estimate": estimate,
+    }
+    transaction: Final = await writer._common_add_spend_log_transaction_to_daily_transaction(
+        payload={
+            "request_id": "req-savings-estimate",
+            "user": "test-user",
+            "startTime": "2026-09-15T00:00:00",
+            "api_key": "test-key",
+            "model": "claude-sonnet-5",
+            "custom_llm_provider": "anthropic",
+            "model_group": "test-auto",
+            "call_type": "anthropic_messages",
+            "prompt_tokens": 100,
+            "completion_tokens": 10,
+            "spend": 0.01,
+            "metadata": json.dumps(metadata),
+        },
+        prisma_client=prisma,
+        type="user",
+    )
+    assert transaction is not None
+    assert transaction["spend"] == 0.01
+    assert transaction["autorouter_savings_spend"] == expected
 
 
 @pytest.mark.asyncio

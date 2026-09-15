@@ -7767,6 +7767,24 @@ class TestRecordRoutingDecision:
         assert "routing_decision" not in request_kwargs["litellm_metadata"]
         assert request_kwargs["metadata"]["keep"] == 1
 
+    def test_baseline_count_authority_is_server_stamped_and_cleared(self) -> None:
+        from litellm.types.router import BaselineRouteStamp
+
+        request_kwargs: Final = {"litellm_metadata": {}}
+        Router._record_routing_decision(
+            request_kwargs=request_kwargs,
+            routing_decision={
+                **self.DECISION,
+                "savings_baseline_model": "anthropic/claude-opus-5",
+                "savings_baseline_deployment_id": "opus-deployment",
+            },
+        )
+        stamp: Final = request_kwargs["litellm_metadata"]["_autorouter_baseline_route"]
+        assert isinstance(stamp, BaselineRouteStamp)
+        assert stamp.baseline_deployment_id == "opus-deployment"
+        Router._record_routing_decision(request_kwargs=request_kwargs, routing_decision=None)
+        assert "_autorouter_baseline_route" not in request_kwargs["litellm_metadata"]
+
     def test_none_creates_no_bucket_on_a_request_that_had_none(self):
         request_kwargs: Dict = {}
         Router._record_routing_decision(request_kwargs=request_kwargs, routing_decision=None)
